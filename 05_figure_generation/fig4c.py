@@ -1,591 +1,542 @@
+# -*- coding: utf-8 -*-
+"""
+fig_global_pls_coef_lollipop_vertical.py
+
+目的：
+    将全局 PLS 模型中 coef_std 绝对值前20的特征，
+    画成“竖着的棒棒糖图”。
+
+要求：
+    1. 竖向棒棒糖图（x为特征位置，y为coef_std）
+    2. 特征标签放在0线另一侧：
+       - coef_std > 0: 标签放在0线下方
+       - coef_std < 0: 标签放在0线上方
+    3. 底部用彩色分类条表示一级类别，并加短标签
+    4. 每类内排序：先正向，再负向；各自按 abs(coef_std) 降序
+    5. 圆点大小一致
+    6. y轴范围固定为 (-0.2, 0.3)
+    7. 去掉 abs(coef_std) 图例
+    8. 类别图例标题为 Category，图例用方块
+"""
+
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib as mpl
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+import matplotlib.transforms as transforms
 
-from pathlib import Path
-from scipy.stats import pearsonr
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from matplotlib.patches import Patch
+warnings.filterwarnings("ignore")
 
 # =========================================================
-# 0. 路径配置
+# 0. 路径设置
 # =========================================================
 BASE_DIR = Path(r"D:\博士\博士代码\data_analysis\formal_v2")
-SCORE_FILE = BASE_DIR / "fig5b" / "fig5b_validation_candidate_scores.csv"
+WEIGHT_FILE_CANDIDATES = [
+    BASE_DIR / "nipals_model_save" / "feature_importance_discovery_model.csv",
+    BASE_DIR / "nipals_model_save" / "feature_importance.csv",
+    BASE_DIR / "nipals_outputs_new" / "feature_importance_discovery_model.csv",
+]
 
-OUTDIR = BASE_DIR / "fig5c"
+OUTDIR = BASE_DIR / "fig4c"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 # =========================================================
-# 1. 绘图风格：对齐 fig2f.py
+# 1. 参数设置
 # =========================================================
-sns.set_style("white")
+TOP_N = 20
+FEATURE_COL = "feature"
+COEF_COL = "coef_std"
 
-plt.rcParams.update({
-    "font.family": "sans-serif",
-    "font.sans-serif": ["Arial"],
-    "font.size": 6,
-    "axes.labelsize": 6,
-    "xtick.labelsize": 6,
-    "ytick.labelsize": 6,
-    "figure.dpi": 300,
-    "savefig.dpi": 300,
-    "pdf.fonttype": 42,
-    "ps.fonttype": 42,
-    "svg.fonttype": "none",
-})
+Y_MIN = -0.2
+Y_MAX = 0.3
 
+POINT_SIZE = 260
+ZERO_LINE_COLOR = "#8a8a8a"
 
-
-# =========================================================
-# 2. 模型配置：沿用 fig5b.py
-# =========================================================
-ORGAN_ORDER = ["Liver", "Coagulation", "Cardiovascular", "Renal", "Respiratory"]
-
-ORGAN_COLORS = {
-    "Respiratory": "#1f77b4",
-    "Cardiovascular": "#ff7f0e",
-    "Renal": "#2ca02c",
-    "Liver": "#d62728",
-    "Coagulation": "#9467bd",
-}
-
-GROUPS = [
-    ("No chronic history", "No-chronic", "--"),
-    ("Any chronic history", "Chronic", "-"),
+CATEGORY_ORDER = [
+    "Demographics",
+    "Chronic disease-related vulnerability",
+    "Systemic acute sepsis response",
+    "Early Interventions"
 ]
 
-MIN_N_CORR = 3
+CATEGORY_COLORS = {
+    "Demographics": "#9ecae1",
+    "Chronic disease-related vulnerability": "#f4a261",
+    "Systemic acute sepsis response": "#e76f51",
+    "Early Interventions": "#8bc34a"
+}
+
+CATEGORY_SHORT_LABELS = {
+    "Early Interventions": "Interventions",
+    "Systemic acute sepsis response": "sepsis response",
+    "Chronic disease-related vulnerability": "chronic"
+}
+
+# 标签离0线的距离（数据坐标）
+LABEL_OFFSET = 0.02
+
+# 底部分类条参数（轴坐标）
+BAR_Y = -0.17
+BAR_H = 0.08
+
+# =========================================================
+# 2. 画图风格
+# =========================================================
+mpl.rcParams["figure.dpi"] = 300
+plt.rcParams["font.family"] = "Arial"
+plt.rcParams["font.size"] = 6
+plt.rcParams["axes.titlesize"] = 6
+plt.rcParams["axes.labelsize"] = 6
+plt.rcParams["xtick.labelsize"] = 6
+plt.rcParams["ytick.labelsize"] = 6
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
+
+# =========================================================
+# 3. 一级类别映射
+# =========================================================
+DEMOGRAPHICS_FEATURES = {
+    "age", "gender", "sex", "sex_male", "male", "weight", "bmi", "weight_bmi"
+}
+
+CHRONIC_VULNERABILITY_FEATURES = {
+    "charlson_comorbidity_index", "cci",
+
+    "hypertension", "hypertension_flag",
+    "systolic_blood_pressure", "mean_blood_pressure", "diastolic_blood_pressure",
+    "sbp", "mbp", "map", "dbp", "heart_rate",
+
+    "chf", "chf_flag", "ntprobnp", "nt_pro_bnp", "troponin_t", "ck_mb",
+
+    "diabetes", "diabetes_flag", "glucose", "glycemic_variability", "glycemic_variability_cv", "hba1c", "anion_gap",
+
+    "cancer", "cancer_flag", "albumin", "hemoglobin", "platelets_count",
+    "platelet_count", "platelet", "platelets",
+
+    "copd_rld", "copd_rld_flag", "copd", "rld",
+    "respiratory_rate", "spo2", "pao2", "paco2", "pao2_fio2_ratio",
+    "base_excess", "bicarbonate", "hco3",
+
+    "ckd", "ckd_flag", "bun", "creatinine", "urine_output",
+    "potassium", "sodium", "chloride", "magnesium", "calcium",
+    "carbon_dioxide", "co2", "ionized_calcium",
+
+    "cld_flag", "mild_liver_disease", "severe_liver_disease",
+    "sgot", "ast", "sgpt", "alt", "total_bilirubin", "ptt", "pt", "inr"
+}
+
+SYSTEMIC_ACUTE_FEATURES = {
+    "temperature", "gcs", "glasgow_coma_scale", "sofa", "sirs_score",
+    "shock_index", "lactate", "white_blood_cells_count", "wbc", "ph"
+}
+
+EARLY_INTERVENTION_FEATURES = {
+    "mechanical_ventilation", "ventilation", "fio2",
+    "current_iv_fluid_intake_over_6h", "iv_fluid_6h",
+    "max_vasopressor_dose_over_6h", "maximum_dose_of_vasopressor_over_6h",
+    "cumulative_fluid_balance_since_admission",
+    "cumulated_fluid_balance_since_admission", "cumulated_fluid_balance",
+    "fluid_balance"
+}
+
+# =========================================================
+# 4. 工具函数
+# =========================================================
+def ensure_file_exists(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"找不到文件：{path}")
 
 
-def zscore_nonmissing(series):
-    x = pd.to_numeric(series, errors="coerce")
-    mean = x.mean(skipna=True)
-    std = x.std(skipna=True, ddof=0)
-    if pd.isna(std) or std == 0:
-        return pd.Series(np.nan, index=series.index, dtype=float)
-    return (x - mean) / std
+def resolve_weight_file():
+    """
+    定位当前 formal_v2 全局 NIPALS 模型的 feature-importance 文件。
+    这里仍然使用 coef_std，不用 Fig5a 的 correlation loading 替代模型系数。
+    """
+    for path in WEIGHT_FILE_CANDIDATES:
+        if path.exists():
+            print(f"Using current weight file: {path}")
+            return path
 
-
-def build_model_specs(score_df):
-    specs = []
-    for group_label, group_short, linestyle in GROUPS:
-        score_prefix = group_short.lower().replace("-", "_")
-        row_suffix = "No" if "No chronic" in group_label else "Chronic"
-        for organ in ORGAN_ORDER:
-            score_col = f"score_{score_prefix}_{organ.lower()}"
-            if score_col not in score_df.columns:
-                raise ValueError(f"候选模型分数字段缺失：{score_col}")
-            specs.append({
-                "model_name": f"{organ} ({row_suffix})",
-                "score_col": score_col,
-                "organ": organ,
-                "group": group_label,
-                "linestyle": linestyle,
-                "color": ORGAN_COLORS[organ],
-            })
-    specs.append({
-        "model_name": "Risk",
-        "score_col": "risk_score_z",
-        "organ": "Risk",
-        "group": "Overall",
-        "linestyle": "-",
-        "color": "black",
-    })
-    return specs
-
-
-def load_plot_df():
-    if not SCORE_FILE.exists():
-        raise FileNotFoundError(
-            f"找不到文件: {SCORE_FILE}。请先运行当前版 fig5b.py。"
-        )
-
-    score_df = pd.read_csv(
-        SCORE_FILE,
-        low_memory=False
+    tried = "\n".join(f"  - {p}" for p in WEIGHT_FILE_CANDIDATES)
+    raise FileNotFoundError(
+        "找不到当前 global NIPALS 的 feature-importance 文件。已尝试：\n"
+        + tried
     )
 
-    need_cols = [
-        "stay_id",
-        "any_chronic_history",
-        "risk_score",
-        "burden5_official_24_48",
-    ]
+def normalize_feature_name(x: str):
+    x = str(x).strip().lower()
+    x = x.replace(" ", "_").replace("-", "_").replace("/", "_")
+    return x
 
-    missing = [
-        c
-        for c in need_cols
-        if c not in score_df.columns
-    ]
+def assign_primary_category(feature_name: str):
+    f = normalize_feature_name(feature_name)
 
-    if missing:
-        raise ValueError(
-            f"fig5b_validation_candidate_scores.csv 缺少列：{missing}"
-        )
+    if f in DEMOGRAPHICS_FEATURES:
+        return "Demographics"
+    elif f in CHRONIC_VULNERABILITY_FEATURES:
+        return "Chronic disease-related vulnerability"
+    elif f in SYSTEMIC_ACUTE_FEATURES:
+        return "Systemic acute sepsis response"
+    elif f in EARLY_INTERVENTION_FEATURES:
+        return "Early Interventions"
+    else:
+        return "Other"
 
-    keep_cols = need_cols + [
-        c
-        for c in score_df.columns
-        if c.startswith("score_")
-    ]
+def prettify_feature_name(x):
+    x = str(x)
 
-    plot_df = score_df[
-        keep_cols
-    ].drop_duplicates(
-        "stay_id"
-    ).copy()
+    replace_dict = {
+        "_": " ",
+        "sbp": "SBP",
+        "dbp": "DBP",
+        "mbp": "MBP",
+        "map": "MAP",
+        "spo2": "SpO2",
+        "pao2": "PaO2",
+        "paco2": "PaCO2",
+        "fio2": "FiO2",
+        "bun": "BUN",
+        "ck mb": "CK-MB",
+        "ntprobnp": "NT-proBNP",
+        "hba1c": "HbA1c",
+        "inr": "INR",
+        "ptt": "PTT",
+        "pt": "PT",
+        "cci": "CCI",
+        "gcs": "GCS",
+        "sofa": "SOFA",
+        "sirs": "SIRS",
+        "wbc": "WBC",
+        "copd rld": "COPD/RLD"
+    }
 
+    out = x.lower()
+    for old, new in replace_dict.items():
+        out = out.replace(old, new)
+
+    words = []
+    for w in out.split():
+        if w.isupper() or "-" in w or "/" in w or any(ch.isdigit() for ch in w):
+            words.append(w)
+        else:
+            words.append(w.capitalize())
+
+    return " ".join(words)
+
+# =========================================================
+# 5. 读取数据
+# =========================================================
+WEIGHT_FILE = resolve_weight_file()
+ensure_file_exists(WEIGHT_FILE)
+
+df = pd.read_csv(
+    WEIGHT_FILE,
+    low_memory=False
+)
+print("Current weight file shape:", df.shape)
+print("Columns:", df.columns.tolist())
+
+if FEATURE_COL not in df.columns:
+    raise ValueError(f"未找到列：{FEATURE_COL}")
+if COEF_COL not in df.columns:
+    raise ValueError(f"未找到列：{COEF_COL}")
+
+plot_df = df[[FEATURE_COL, COEF_COL]].copy()
+plot_df = plot_df.rename(columns={FEATURE_COL: "feature", COEF_COL: "coef_std"})
+plot_df["coef_std"] = pd.to_numeric(plot_df["coef_std"], errors="coerce")
+plot_df = plot_df.dropna(subset=["feature", "coef_std"]).copy()
+
+# =========================================================
+# 6. 选取前20并排序
+# =========================================================
+plot_df["abs_coef_std"] = plot_df["coef_std"].abs()
+plot_df["primary_category"] = plot_df["feature"].apply(assign_primary_category)
+
+other_features = plot_df.loc[
+    plot_df["primary_category"] == "Other",
+    "feature"
+].tolist()
+
+if other_features:
     print(
-        f"Current validation rows from Fig5b = "
-        f"{len(plot_df):,}"
+        "WARNING: 以下当前特征未映射到四个一级类别：",
+        other_features
     )
 
-    if len(plot_df) != 6246:
-        print(
-            f"WARNING: expected current common validation N=6,246, "
-            f"but current N={len(plot_df):,}."
-        )
+top_df = (
+    plot_df
+    .sort_values("abs_coef_std", ascending=False)
+    .head(TOP_N)
+    .copy()
+)
 
-    score_cols = [
-        c
-        for c in plot_df.columns
-        if c.startswith("score_")
-    ]
+cat_order_map = {cat: i for i, cat in enumerate(CATEGORY_ORDER)}
+top_df["category_order"] = top_df["primary_category"].map(cat_order_map).fillna(999)
 
-    print("\nCandidate score non-missing counts:")
-    for c in score_cols:
-        print(
-            c,
-            int(
-                plot_df[c].notna().sum()
-            ),
-            "/",
-            len(plot_df)
-        )
+# 每类内：先正向，再负向；每组内部按 abs(coef_std) 从大到小
+top_df["sign_order"] = np.where(top_df["coef_std"] >= 0, 0, 1)
 
-    plot_df[
-        "burden5_official_24_48"
-    ] = pd.to_numeric(
-        plot_df[
-            "burden5_official_24_48"
-        ],
-        errors="coerce"
+top_df = (
+    top_df
+    .sort_values(
+        ["category_order", "sign_order", "abs_coef_std"],
+        ascending=[True, True, False]
+    )
+    .reset_index(drop=True)
+)
+
+top_df["feature_label"] = top_df["feature"].apply(prettify_feature_name)
+top_df["color"] = top_df["primary_category"].map(CATEGORY_COLORS).fillna("#bdbdbd")
+top_df["point_size"] = POINT_SIZE
+
+top_df.to_csv(
+    OUTDIR / "current_global_pls_coef_std_top20_vertical.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\nTop features after grouping:")
+print(top_df[["feature", "coef_std", "abs_coef_std", "primary_category"]].round(4))
+
+# =========================================================
+# 7. 计算每个类别在图中的位置范围
+# =========================================================
+category_spans = []
+for cat in CATEGORY_ORDER:
+    sub = top_df[top_df["primary_category"] == cat]
+    if len(sub) == 0:
+        continue
+    idx_min = sub.index.min()
+    idx_max = sub.index.max()
+    category_spans.append((cat, idx_min, idx_max))
+
+# =========================================================
+# 8. 绘图
+# =========================================================
+fig, ax = plt.subplots(figsize=(10, 5.1))
+
+x_pos = np.arange(len(top_df))
+
+# 0线
+ax.axhline(
+    0,
+    color=ZERO_LINE_COLOR,
+    linestyle="--",
+    linewidth=1.1,
+    zorder=1
+)
+
+# 棒棒糖主线、圆点、数值、标签
+for i, row in top_df.iterrows():
+    coef = row["coef_std"]
+    color = row["color"]
+    label = row["feature_label"]
+
+    # 主线
+    ax.vlines(
+        x=i,
+        ymin=0,
+        ymax=coef,
+        color=color,
+        linewidth=3.0,
+        alpha=0.65,
+        zorder=2
     )
 
-    plot_df[
-        "risk_score"
-    ] = pd.to_numeric(
-        plot_df[
-            "risk_score"
-        ],
-        errors="coerce"
+    # 圆点
+    ax.scatter(
+        i,
+        coef,
+        s=row["point_size"],
+        color=color,
+        alpha=0.90,
+        edgecolor="white",
+        linewidth=1.0,
+        zorder=3
     )
 
-    plot_df[
-        "any_chronic_history"
-    ] = (
-        pd.to_numeric(
-            plot_df[
-                "any_chronic_history"
-            ],
-            errors="coerce"
-        )
-        .fillna(0)
-        .astype(int)
-    )
-
-    plot_df = plot_df.dropna(
-        subset=[
-            "burden5_official_24_48",
-            "risk_score"
-        ]
-    ).copy()
-
-    plot_df[
-        "burden5_official_24_48"
-    ] = (
-        plot_df[
-            "burden5_official_24_48"
-        ]
-        .round()
-        .astype(int)
-    )
-
-    plot_df[
-        "risk_score_z"
-    ] = zscore_nonmissing(
-        plot_df[
-            "risk_score"
-        ]
-    )
-
-    model_specs = build_model_specs(
-        plot_df
-    )
-
-    for spec in model_specs:
-        if spec["score_col"] == "risk_score_z":
-            continue
-
-        plot_df[
-            spec["score_col"]
-            +
-            "_z"
-        ] = zscore_nonmissing(
-            plot_df[
-                spec["score_col"]
-            ]
-        )
-
-        spec[
-            "plot_col"
-        ] = (
-            spec[
-                "score_col"
-            ]
-            +
-            "_z"
-        )
-
-    for spec in model_specs:
-        if spec["score_col"] == "risk_score_z":
-            spec["plot_col"] = "risk_score_z"
-
-    return (
-        plot_df,
-        model_specs
-    )
-
-
-def compute_correlations(plot_df, model_specs):
-    rows = []
-    for spec in model_specs:
-        if spec["group"] == "No chronic history":
-            sub = plot_df.loc[
-                plot_df["any_chronic_history"] == 0,
-                ["burden5_official_24_48", spec["plot_col"]],
-            ].dropna().copy()
-            column_group = "No chronic history"
-        elif spec["group"] == "Any chronic history":
-            sub = plot_df.loc[
-                plot_df["any_chronic_history"] == 1,
-                ["burden5_official_24_48", spec["plot_col"]],
-            ].dropna().copy()
-            column_group = "Any chronic history"
-        else:
-            sub = plot_df[["burden5_official_24_48", spec["plot_col"]]].dropna().copy()
-            column_group = "Overall"
-
-        if len(sub) < MIN_N_CORR:
-            corr = np.nan
-            pval = np.nan
-        elif sub["burden5_official_24_48"].nunique() < 2:
-            corr = np.nan
-            pval = np.nan
-        elif sub[spec["plot_col"]].std(ddof=0) == 0:
-            corr = np.nan
-            pval = np.nan
-        else:
-            corr, pval = pearsonr(sub["burden5_official_24_48"], sub[spec["plot_col"]])
-
-        rows.append({
-            "model_name": spec["model_name"],
-            "organ": spec["organ"],
-            "group": spec["group"],
-            "column_group": column_group,
-            "n_for_correlation": len(sub),
-            "correlation_r": corr,
-            "p_value": pval,
-        })
-
-    corr_df = pd.DataFrame(rows)
-    organ_order_for_heatmap = ["Risk"] + ORGAN_ORDER
-    corr_mat = pd.DataFrame(
-        np.nan,
-        index=organ_order_for_heatmap,
-        columns=["No chronic history", "Any chronic history"],
-        dtype=float,
-    )
-
-    for _, row in corr_df.iterrows():
-        organ = row["organ"]
-        col_group = row["column_group"]
-
-        if organ == "Risk":
-            if col_group == "Overall":
-                corr_mat.loc["Risk", "No chronic history"] = row["correlation_r"]
-                corr_mat.loc["Risk", "Any chronic history"] = row["correlation_r"]
-        elif col_group in corr_mat.columns and organ in corr_mat.index:
-            corr_mat.loc[organ, col_group] = row["correlation_r"]
-
-    return corr_df, corr_mat
-
-
-def draw_figure(plot_df, model_specs, corr_mat):
-    fig = plt.figure(figsize=(3.2, 2.2))
-    gs = fig.add_gridspec(1, 2, width_ratios=[2.35, 1.45], wspace=0.04)
-
-    ax_reg = fig.add_subplot(gs[0, 0])
-    ax_hm = fig.add_subplot(gs[0, 1])
-
-    # Left panel: each subgroup-specific model is plotted only within
-    # the chronic stratum in which that candidate model was trained.
-    for spec in model_specs:
-        if spec["group"] == "No chronic history":
-            base_df = plot_df[
-                plot_df["any_chronic_history"] == 0
-            ].copy()
-        elif spec["group"] == "Any chronic history":
-            base_df = plot_df[
-                plot_df["any_chronic_history"] == 1
-            ].copy()
-        else:
-            base_df = plot_df.copy()
-
-        reg_df = base_df[
-            ["burden5_official_24_48", spec["plot_col"]]
-        ].dropna().copy()
-
-        if reg_df.empty:
-            continue
-        with plt.rc_context({"lines.linewidth": 0.8}):
-            sns.regplot(
-                ax=ax_reg,
-                data=reg_df,
-                x="burden5_official_24_48",
-                y=spec["plot_col"],
-                x_estimator=np.mean,
-                ci=95,  # 画透明置信区间
-                x_ci=95,
-                truncate=False,
-                color=spec["color"],
-                line_kws={
-                    "linestyle": spec["linestyle"],
-                    "lw": 0.8,
-                    "alpha": 1.0,
-                    "color": spec["color"],
-                },
-                scatter_kws={
-                    "s": 42,
-                    "alpha": 1.0,
-                    "edgecolor": "none",
-                    "color": spec["color"],
-                },
-            )
-    ax_reg.set_xlim(-0.5, 5.5)
-    ax_reg.set_xticks([0, 1, 2, 3, 4, 5])
-    ax_reg.set_xlabel("24–48 h organ-failure numbers")
-    ax_reg.set_ylabel("Z-model score")
-    ax_reg.set_ylim(-1, 4)
-
-    ax_reg.set_yticks([
-        -1,
-        0,
-        1,
-        2,
-        3,
-        4
-    ])
-    ax_reg.set_aspect("auto")
-    ax_reg.spines["top"].set_visible(False)
-    ax_reg.spines["right"].set_visible(False)
-    ax_reg.spines["left"].set_linewidth(0.5)
-    ax_reg.spines["bottom"].set_linewidth(0.5)
-    # 让 x 轴和 y 轴向外偏移，左下角不相连
-    ax_reg.spines["left"].set_position(("outward", 12))
-    ax_reg.spines["bottom"].set_position(("outward", 12))
-
-    # x 轴只画到 0–5 的刻度范围
-    ax_reg.spines["bottom"].set_bounds(0, 5)
-
-    # y 轴只画到当前主要刻度范围
-    fig.canvas.draw()
-    yticks = np.array(ax_reg.get_yticks())
-    yticks = yticks[
-        (yticks >= ax_reg.get_ylim()[0]) &
-        (yticks <= ax_reg.get_ylim()[1])
-        ]
-    if len(yticks) >= 2:
-        ax_reg.spines["left"].set_bounds(yticks[0], yticks[-1])
-
-    # 保留刻度线
-    ax_reg.tick_params(
-        axis="both",
-        which="major",
-        bottom=True,
-        left=True,
-        length=3,
-        width=0.5,
-        direction="out"
-    )
-
-    # 颜色图例：器官 + 主 risk
-    organ_handles = []
-    organ_labels = []
-    for organ in ORGAN_ORDER:
-        handle = Patch(
-            facecolor=ORGAN_COLORS[organ],
-            edgecolor="none"
-        )
-        organ_handles.append(handle)
-        organ_labels.append(organ)
-
-    risk_handle = Patch(
-        facecolor="black",
-        edgecolor="none"
-    )
-    organ_handles.append(risk_handle)
-    organ_labels.append("Risk")
-
-    leg_color = ax_reg.legend(
-        organ_handles,
-        organ_labels,
-        frameon=False,
-        loc="upper left",
+    # 圆点内数值
+    ax.text(
+        i,
+        coef,
+        f"{coef:.2f}",
+        ha="center",
+        va="center",
         fontsize=6,
-        handlelength=1.0,
-        handleheight=1.0,
-        borderpad=0.2,
-        labelspacing=0.25,
-    )
-    ax_reg.add_artist(leg_color)
-
-    # 线型图例：慢病组别
-    handle_no, = ax_reg.plot([], [], "--", color="black", lw=2.0)
-    handle_any, = ax_reg.plot([], [], "-", color="black", lw=2.0)
-    ax_reg.legend(
-        [handle_no, handle_any],
-        ["No chronic history", "Any chronic history"],
-        frameon=False,
-        loc="lower right",
-        fontsize=6,
-        handlelength=1.6,
-        borderpad=0.2,
-        labelspacing=0.3,
+        color="black",
+        zorder=4
     )
 
-    # 右图：相关性热图
-    vmin = 0.3
-    vmax = 0.7
-    im = ax_hm.imshow(corr_mat.values, aspect="equal", cmap="magma_r", vmin=vmin, vmax=vmax)
+    # 标签放在0线另一侧
+    if coef >= 0:
+        # 正向 -> 标签放0线下方
+        ax.text(
+            i,
+            -LABEL_OFFSET,
+            label,
+            ha="center",
+            va="top",
+            rotation=90,
+            fontsize=6,
+            color="black",
+            zorder=5
+        )
+    else:
+        # 负向 -> 标签放0线上方
+        ax.text(
+            i,
+            LABEL_OFFSET,
+            label,
+            ha="center",
+            va="bottom",
+            rotation=90,
+            fontsize=6,
+            color="black",
+            zorder=5
+        )
 
-    threshold = (vmin + vmax) / 2
+# 轴范围与刻度
+ax.set_xlim(-0.8, len(top_df) - 0.2)
+ax.set_ylim(Y_MIN, Y_MAX)
+ax.set_yticks([-0.2, -0.1, 0.0, 0.1, 0.2, 0.3])
 
-    # 第一行 Risk：两列合并，只写一个居中的数字
-    risk_val = corr_mat.iloc[0, 0]
+# 不显示常规x刻度文字
+ax.set_xticks([])
 
-    if pd.notna(risk_val):
-        text_color = "white" if risk_val > threshold else "black"
+ax.set_ylabel("Standardized coefficient (coef_std)")
+ax.set_title(
+    f"Top {TOP_N} features ranked by |coef_std| in the current global NIPALS model",
+    pad=16,
+    fontweight="bold"
+)
 
-        # imshow 中两列中心分别是 x=0 和 x=1
-        # 两列合并后的中心是 x=0.5；第一行中心是 y=0
-        ax_hm.text(
-            0.5,
-            0,
-            f"{risk_val:.2f}",
+# =========================================================
+# 9. 底部分类彩条
+# =========================================================
+trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+
+for cat, idx_min, idx_max in category_spans:
+    color = CATEGORY_COLORS.get(cat, "#bdbdbd")
+
+    x0 = idx_min - 0.45
+    w = (idx_max - idx_min + 1) * 0.90
+
+    # 让 chronic 那条略长一点
+    if cat == "Chronic disease-related vulnerability":
+        x0 = idx_min - 0.60
+        w = (idx_max - idx_min + 1) * 1
+
+    rect = Rectangle(
+        (x0, BAR_Y),
+        w,
+        BAR_H,
+        transform=trans,
+        facecolor=color,
+        edgecolor="none",
+        alpha=0.95,
+        clip_on=False,
+        zorder=0
+    )
+    ax.add_patch(rect)
+
+    if cat in CATEGORY_SHORT_LABELS:
+        ax.text(
+            x0 + w / 2,
+            BAR_Y + BAR_H / 2,
+            CATEGORY_SHORT_LABELS[cat],
+            transform=trans,
             ha="center",
             va="center",
-            color=text_color,
             fontsize=6,
-            zorder=6,
+            fontweight="bold",
+            color="white",
+            clip_on=False
         )
 
-    # 从第二行开始，每个格子正常写数字
-    for i in range(1, corr_mat.shape[0]):
-        for j in range(corr_mat.shape[1]):
-            val = corr_mat.iloc[i, j]
+# =========================================================
+# 10. Positive / Negative 文字
+# =========================================================
+ax.text(
+    -0.65,
+    0.245,
+    "Positive",
+    ha="left",
+    va="center",
+    fontsize=6,
+    fontweight="bold",
+    color="#B23A48"
+)
 
-            if pd.notna(val):
-                text_color = "white" if val > threshold else "black"
+ax.text(
+    -0.65,
+    -0.185,
+    "Negative",
+    ha="left",
+    va="center",
+    fontsize=6,
+    fontweight="bold",
+    color="#336699"
+)
 
-                # imshow 的格子中心就是 j, i
-                ax_hm.text(
-                    j,
-                    i,
-                    f"{val:.2f}",
-                    ha="center",
-                    va="center",
-                    color=text_color,
-                    fontsize=6,
-                    zorder=6,
-                )
-
-    ax_hm.set_xticks([0, 1])
-    xtick_labels = ax_hm.set_xticklabels(
-        ["No chronic\nhistory", "Any chronic\nhistory"],
-        rotation=90,
-    )
-    xtick_labels[0].set_color("#f39c12")
-    xtick_labels[1].set_color("#e41a1c")
-    ax_hm.set_yticks(np.arange(len(corr_mat.index)))
-    ax_hm.set_yticklabels([""] * len(corr_mat.index))
-    ax_hm.set_ylabel("Correlations (r)", fontsize=6, rotation=270, labelpad=28)
-    ax_hm.yaxis.set_label_position("right")
-    # 左侧彩色条
-    for i, row_name in enumerate(corr_mat.index):
-        if row_name == "Risk":
-            color = "black"
-        else:
-            color = ORGAN_COLORS[row_name]
-        ax_hm.add_patch(
-            plt.Rectangle(
-                (-0.55, i - 0.5),
-                0.15,
-                1.0,
-                color=color,
-                transform=ax_hm.transData,
-                clip_on=False,
+# =========================================================
+# 11. 类别图例
+# =========================================================
+cat_handles = []
+for cat in CATEGORY_ORDER:
+    if cat in top_df["primary_category"].values:
+        cat_handles.append(
+            Line2D(
+                [0], [0],
+                marker="s",
+                color="none",
+                markerfacecolor=CATEGORY_COLORS[cat],
+                markeredgecolor="none",
+                markersize=10,
+                label=cat
             )
         )
 
-    cax = inset_axes(
-        ax_hm,
-        width="55%",
-        height="4.5%",
-        loc="upper center",
-        bbox_to_anchor=(0, 0.1, 1, 1),
-        bbox_transform=ax_hm.transAxes,
-    )
-    cb = fig.colorbar(im, cax=cax, orientation="horizontal")
-    cb.outline.set_visible(False)
-    cb.ax.tick_params(length=0, pad=1)
-    cb.set_label("")
-    cb.set_ticks([])
-    cax.text(-0.08, 0.5, f"{vmin:.1f}", transform=cax.transAxes, va="center", ha="right", fontsize=6)
-    cax.text(1.08, 0.5, f"{vmax:.1f}", transform=cax.transAxes, va="center", ha="left", fontsize=6)
+legend2 = ax.legend(
+    handles=cat_handles,
+    title="Category",
+    frameon=False,
+    loc="center left",
+    bbox_to_anchor=(0.1, 0.88),
+    fontsize=6,
+    title_fontsize=6
+)
 
-    for spine in ax_hm.spines.values():
-        spine.set_visible(False)
-    ax_hm.tick_params(length=0)
+# =========================================================
+# 12. 美化
+# =========================================================
+# 去掉背景网格线
+# ax.grid(False)
 
-    fig.text(0.01, 0.98, "c", fontsize=6, fontweight="bold", va="top")
-    plt.tight_layout()
-    return fig
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+ax.spines["bottom"].set_visible(False)
 
+fig.subplots_adjust(left=0.08, right=0.82, top=0.90, bottom=0.26)
 
-def main():
-    plot_df, model_specs = load_plot_df()
-    corr_df, corr_mat = compute_correlations(plot_df, model_specs)
+png_path = OUTDIR / "current_global_pls_coef_std_top20_vertical_lollipop.png"
+pdf_path = OUTDIR / "current_global_pls_coef_std_top20_vertical_lollipop.pdf"
+svg_path = OUTDIR / "current_global_pls_coef_std_top20_vertical_lollipop.svg"
 
-    plot_df.to_csv(OUTDIR / "fig5c_plot_data.csv", index=False, encoding="utf-8-sig")
-    corr_df.to_csv(OUTDIR / "fig5c_model_correlations.csv", index=False, encoding="utf-8-sig")
+plt.savefig(png_path, dpi=300, bbox_inches="tight")
+plt.savefig(pdf_path, bbox_inches="tight")
+plt.savefig(svg_path, bbox_inches="tight")
 
-    fig = draw_figure(plot_df, model_specs, corr_mat)
-    png_path = OUTDIR / "fig5c_model_score_vs_24_48_organ_failure_number.png"
-    pdf_path = OUTDIR / "fig5c_model_score_vs_24_48_organ_failure_number.pdf"
-    svg_path = OUTDIR / "fig5c_model_score_vs_24_48_organ_failure_number.svg"
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
-    fig.savefig(pdf_path, dpi=300, bbox_inches="tight")
-    fig.savefig(svg_path, bbox_inches="tight")
-    plt.close(fig)
+plt.show()
+plt.close(fig)
 
-    print("\nModel correlations with 24–48 h organ-failure burden:")
-    print(corr_df[["model_name", "n_for_correlation", "correlation_r", "p_value"]].round(3))
-    print(f"\nSaved: {png_path}")
-    print(f"Saved: {pdf_path}")
-
-
-if __name__ == "__main__":
-    main()
+print("\nSaved files:")
+print((OUTDIR / "current_global_pls_coef_std_top20_vertical.csv").resolve())
+print(png_path.resolve())
+print(pdf_path.resolve())

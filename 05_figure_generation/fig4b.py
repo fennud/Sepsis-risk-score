@@ -1,978 +1,605 @@
+# -*- coding: utf-8 -*-
+"""
+fig6h_chronic_vs_nochronic_risk_score_boxplot.py
+
+目的：
+    直接比较不同慢病患者与无慢病患者的 model-derived risk_score 分布。
+
+图：
+    x轴：慢病种类
+    y轴：risk_score
+    每个慢病下面两组箱线图：
+        - No chronic
+        - With disease
+
+统计：
+    1. Mann-Whitney U test：未调整组间比较
+    2. OLS adjusted beta：调整 age + sex + body size
+    3. FDR correction
+
+输入：
+    feature_matrix_full/feature_matrix_full_0_6h.csv
+    fig5b/fig5b_validation_candidate_scores.csv
+
+输出：
+    fig6h_chronic_vs_nochronic_risk_score_boxplot.png
+    fig6h_chronic_vs_nochronic_risk_score_boxplot.pdf
+    fig6h_chronic_vs_nochronic_risk_score_stats.csv
+"""
+
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+import statsmodels.api as sm
+from scipy.stats import mannwhitneyu, ttest_ind
+from statsmodels.stats.multitest import multipletests
+from matplotlib.patches import Patch
 
-from pathlib import Path
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_curve, roc_auc_score
+warnings.filterwarnings("ignore")
 
 # =========================================================
-# 0. Current paths
+# 0. 路径设置
 # =========================================================
 BASE_DIR = Path(r"D:\博士\博士代码\data_analysis\formal_v2")
 
-FULL_MATRIX = (
-    BASE_DIR
-    / "feature_matrix_full"
-    / "feature_matrix_full_0_6h.csv"
-)
+FEATURE_FILE = BASE_DIR / "feature_matrix_full" / "feature_matrix_full_0_6h.csv"
+SCORE_FILE = BASE_DIR / "fig5b" / "fig5b_validation_candidate_scores.csv"
 
-RISK_FILE_CANDIDATES = [
-    BASE_DIR / "nipals_model_save" / "validation_24_48_scored.csv",
-    BASE_DIR / "nipals_model_save" / "validation_baseline_scored.csv",
-    BASE_DIR / "nipals_outputs_new" / "validation_baseline_scored.csv",
-]
-
-OUTDIR = BASE_DIR / "fig5b"
+OUTDIR = BASE_DIR / "fig4b"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-
-def resolve_risk_file():
-    for p in RISK_FILE_CANDIDATES:
-        if p.exists():
-            cols = pd.read_csv(p, nrows=0).columns
-            if "stay_id" in cols and "risk_score" in cols:
-                return p
-
-    raise FileNotFoundError(
-        "No current validation scored file containing stay_id and risk_score was found.\n"
-        + "\n".join(str(p) for p in RISK_FILE_CANDIDATES)
-    )
-
-
-VALIDATION_SCORE_FILE = resolve_risk_file()
-
-DISCOVERY_SCORE_FILE = (
-    BASE_DIR
-    / "nipals_model_save"
-    / "discovery_scored.csv"
-)
-
 # =========================================================
-# 1. 配置
+# 1. 参数设置
 # =========================================================
-RANDOM_STATE = 42
-N_COMPONENTS = 3
-MIN_POS = 20
-MIN_NEG = 20
+# "any": 有某类慢病即可，允许合并其他慢病
+# "single_only": 只患这一种慢病
+DISEASE_GROUP_MODE = "any"
 
-# =========================================================
-# 2. 绘图风格：对齐 fig2f.py
-# =========================================================
-plt.rcParams.update({
-    "font.family": "sans-serif",
-    "font.sans-serif": ["Arial"],
-    "font.size": 6,
-    "axes.labelsize": 6,
-    "xtick.labelsize": 6,
-    "ytick.labelsize": 6,
-    "figure.dpi": 300,
-    "savefig.dpi": 300,
-    "pdf.fonttype": 42,
-    "ps.fonttype": 42,
-    "svg.fonttype": "none",
-})
+# 是否把 risk_score 标准化后再画
+# 如果你想“直接拿模型打出来的 risk_score”，保持 False
+STANDARDIZE_SCORE = False
 
-# =========================================================
-# 3. 与当前模型保持一致的 60 个特征
-# =========================================================
-FEATURES = [
-    "age", "sex_male", "weight",
-    "charlson_comorbidity_index",
-    "hypertension_flag", "diabetes_flag", "chf_flag",
-    "cancer_flag", "copd_rld_flag", "ckd_flag", "cld_flag",
-    "systolic_blood_pressure", "mean_blood_pressure",
-    "diastolic_blood_pressure", "heart_rate",
-    "ntprobnp", "troponin_t", "ck_mb",
-    "glucose", "hba1c", "anion_gap",
-    "albumin", "hemoglobin", "platelets_count",
-    "respiratory_rate", "spo2", "pao2", "paco2",
-    "pao2_fio2_ratio", "base_excess", "bicarbonate",
-    "bun", "creatinine", "urine_output", "potassium", "sodium",
-    "chloride", "magnesium", "calcium", "carbon_dioxide",
-    "ionized_calcium",
-    "sgot_ast", "sgpt_alt", "total_bilirubin", "ptt", "pt", "inr",
-    "temperature", "glasgow_coma_scale", "sirs_score", "shock_index",
-    "lactate", "white_blood_cells_count", "ph",
-    "glycemic_variability_cv",
-    "mechanical_ventilation", "fio2",
-    "current_iv_fluid_intake_over_6h",
-    "max_vasopressor_dose_over_6h",
-    "cumulative_fluid_balance_since_admission",
+SCORE_COL_CANDIDATES = [
+    "risk_score",
+    "overall_risk_score",
+    "pls_score",
+    "PLS",
 ]
 
-CHRONIC_FLAG_COLS = [
-    "hypertension_flag",
-    "diabetes_flag",
-    "chf_flag",
-    "cancer_flag",
-    "copd_rld_flag",
-    "ckd_flag",
-    "cld_flag",
+CHRONIC_FLAGS = {
+    "HTN": "hypertension_flag",
+    "DM": "diabetes_flag",
+    "CHF": "chf_flag",
+    "Cancer": "cancer_flag",
+    "COPD/RLD": "copd_rld_flag",
+    "CKD": "ckd_flag",
+    "CLD": "cld_flag",
+}
+
+DISEASE_ORDER = [
+    "HTN",
+    "DM",
+    "CHF",
+    "Cancer",
+    "COPD/RLD",
+    "CKD",
+    "CLD",
 ]
 
-ORGAN_TARGETS = {
-    "Respiratory": "resp_failure_24_48",
-    "Cardiovascular": "cardio_failure_24_48",
-    "Renal": "renal_failure_24_48",
-    "Liver": "liver_failure_24_48",
-    "Coagulation": "coag_failure_24_48",
+DISEASE_COLORS = {
+    "HTN": "#4C78A8",
+    "DM": "#F58518",
+    "CHF": "#E45756",
+    "Cancer": "#B279A2",
+    "COPD/RLD": "#54A24B",
+    "CKD": "#EECA3B",
+    "CLD": "#72B7B2",
 }
 
-GROUPS = {
-    "No chronic history": 0,
-    "Any chronic history": 1,
-}
+NO_CHRONIC_COLOR = "#BDBDBD"
 
-GROUP_SHORT = {
-    "No chronic history": "No-chronic",
-    "Any chronic history": "Chronic",
-}
+# =========================================================
+# 2. 画图风格
+# =========================================================
+mpl.rcParams["figure.dpi"] = 300
+plt.rcParams["font.family"] = "Arial"
+plt.rcParams["font.size"] = 6
+plt.rcParams["axes.titlesize"] = 6
+plt.rcParams["axes.labelsize"] = 6
+plt.rcParams["xtick.labelsize"] = 6
+plt.rcParams["ytick.labelsize"] = 6
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
 
-LINESTYLES = {
-    "No chronic history": "--",
-    "Any chronic history": "-",
-}
-
-ORGAN_ORDER = ["Liver", "Coagulation", "Cardiovascular", "Renal", "Respiratory"]
-
-ORGAN_COLORS = {
-    "Respiratory": "#1f77b4",
-    "Cardiovascular": "#ff7f0e",
-    "Renal": "#2ca02c",
-    "Liver": "#d62728",
-    "Coagulation": "#9467bd",
-}
+# =========================================================
+# 3. 工具函数
+# =========================================================
+def ensure_file_exists(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"找不到文件：{path}")
 
 
-class NIPALSPLS1:
-    def __init__(self, n_components=2, tol=1e-8, max_iter=500):
-        self.n_components = n_components
-        self.tol = tol
-        self.max_iter = max_iter
-
-    def fit(self, X, y):
-        X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).reshape(-1, 1)
-
-        n, p = X.shape
-        A = min(self.n_components, p, n - 1)
-
-        Xh = X.copy()
-        yh = y.copy()
-
-        W = np.zeros((p, A))
-        P = np.zeros((p, A))
-        T = np.zeros((n, A))
-        C = np.zeros((1, A))
-
-        for a in range(A):
-            u = yh[:, [0]].copy()
-
-            for _ in range(self.max_iter):
-                w = Xh.T @ u
-                norm_w = np.linalg.norm(w)
-                if norm_w < 1e-12:
-                    break
-                w = w / norm_w
-
-                t = Xh @ w
-                tt = float(t.T @ t)
-                if tt < 1e-12:
-                    break
-
-                c = (yh.T @ t) / tt
-                cc = float(c @ c.T)
-                if cc < 1e-12:
-                    break
-
-                u_new = yh @ c.T / cc
-                if np.linalg.norm(u_new - u) < self.tol:
-                    u = u_new
-                    break
-                u = u_new
-
-            p = (Xh.T @ t) / (float(t.T @ t) + 1e-12)
-            c = (yh.T @ t) / (float(t.T @ t) + 1e-12)
-
-            Xh = Xh - t @ p.T
-            yh = yh - t @ c
-
-            W[:, a] = w.ravel()
-            P[:, a] = p.ravel()
-            T[:, a] = t.ravel()
-            C[:, a] = c.ravel()
-
-        self.W_ = W
-        self.P_ = P
-        self.T_ = T
-        self.C_ = C
-        self.B_ = W @ np.linalg.inv(P.T @ W) @ C.T
-        return self
-
-    def predict(self, X):
-        X = np.asarray(X, dtype=float)
-        return (X @ self.B_).ravel()
-
-
-def ensure_required_cols(df, cols, df_name):
+def ensure_cols(df: pd.DataFrame, cols, desc="data"):
     missing = [c for c in cols if c not in df.columns]
     if missing:
-        raise ValueError(f"{df_name} 缺少列：{missing}")
+        raise ValueError(f"{desc} 缺少以下字段：{missing}")
 
 
-def prepare_data(df):
+def prepare_binary_flag(s):
+    s = pd.to_numeric(s, errors="coerce").fillna(0)
+    return (s > 0).astype(int)
+
+
+def maybe_create_cld_flag(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    mild = pd.to_numeric(
-        df["mild_liver_disease"],
-        errors="coerce"
-    ).fillna(0)
+    if "cld_flag" in df.columns:
+        df["cld_flag"] = prepare_binary_flag(df["cld_flag"])
+        return df
 
-    severe = pd.to_numeric(
-        df["severe_liver_disease"],
-        errors="coerce"
-    ).fillna(0)
+    candidate_pairs = [
+        ("mild_liver_disease", "severe_liver_disease"),
+        ("mild_liver", "severe_liver"),
+        ("mild_liver_disease_flag", "severe_liver_disease_flag"),
+    ]
 
-    df["cld_flag"] = (
-        (mild > 0)
-        |
-        (severe > 0)
-    ).astype(int)
+    for mild_col, severe_col in candidate_pairs:
+        if mild_col in df.columns and severe_col in df.columns:
+            df["cld_flag"] = (
+                prepare_binary_flag(df[mild_col]) |
+                prepare_binary_flag(df[severe_col])
+            ).astype(int)
+            print(f"未发现 cld_flag，已根据 {mild_col} 和 {severe_col} 自动生成 cld_flag。")
+            return df
 
-    for c in CHRONIC_FLAG_COLS:
-        if c not in df.columns:
-            raise ValueError(f"数据中缺少慢病字段：{c}")
+    raise ValueError("缺少 cld_flag，且无法根据 mild/severe liver disease 自动生成。")
 
-        df[c] = (
-            pd.to_numeric(df[c], errors="coerce")
-            .fillna(0)
-            .gt(0)
-            .astype(int)
-        )
 
-    df["any_chronic_history"] = (
-        df[CHRONIC_FLAG_COLS].sum(axis=1) > 0
-    ).astype(int)
+def add_sex_male_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-    # Preserve outcome missingness.
-    for target in ORGAN_TARGETS.values():
-        if target not in df.columns:
-            raise ValueError(f"数据中缺少器官结局字段：{target}")
+    if "sex_male" in df.columns:
+        df["sex_male"] = prepare_binary_flag(df["sex_male"])
+        return df
 
-        s = pd.to_numeric(df[target], errors="coerce")
-        out = pd.Series(np.nan, index=df.index, dtype=float)
-        mask = s.notna()
-        out.loc[mask] = (s.loc[mask] > 0).astype(float)
-        df[target] = out
+    for c in ["sex", "gender"]:
+        if c in df.columns:
+            s = df[c].astype(str).str.upper().str.strip()
+            df["sex_male"] = s.isin(["M", "MALE", "1"]).astype(int)
+            print(f"未发现 sex_male，已根据 {c} 自动生成 sex_male。")
+            return df
 
+    print("警告：未发现 sex_male / sex / gender，调整模型不纳入性别。")
     return df
 
 
-def fit_one_candidate_model(df_train, df_val, features, target, n_components=3):
-    train = df_train[
-        df_train[target].notna()
-    ].copy()
-
-    val = df_val[
-        df_val[target].notna()
-    ].copy()
-
-    y_train = train[
-        target
-    ].astype(int).values
-
-    y_val = val[
-        target
-    ].astype(int).values
-
-    n_pos_train = int(
-        (y_train == 1).sum()
-    )
-
-    n_neg_train = int(
-        (y_train == 0).sum()
-    )
-
-    n_pos_val = int(
-        (y_val == 1).sum()
-    )
-
-    n_neg_val = int(
-        (y_val == 0).sum()
-    )
-
-    if (
-        n_pos_train < MIN_POS
-        or
-        n_neg_train < MIN_NEG
-    ):
-        raise ValueError(
-            f"训练集样本不足: {target}, "
-            f"pos={n_pos_train}, neg={n_neg_train}"
-        )
-
-    if (
-        n_pos_val < MIN_POS
-        or
-        n_neg_val < MIN_NEG
-    ):
-        raise ValueError(
-            f"验证集样本不足: {target}, "
-            f"pos={n_pos_val}, neg={n_neg_val}"
-        )
-
-    X_train_df = train[
-        features
-    ].apply(
-        pd.to_numeric,
-        errors="coerce"
-    )
-
-    X_val_df = val[
-        features
-    ].apply(
-        pd.to_numeric,
-        errors="coerce"
-    )
-
-    # Discovery-only median imputation.
-    # Entirely missing training features are assigned 0 so dimensionality
-    # remains exactly the current 60-feature space.
-    feature_medians = X_train_df.median(
-        axis=0,
-        skipna=True
-    ).fillna(
-        0.0
-    )
-
-    X_train_imp = X_train_df.fillna(
-        feature_medians
-    ).values
-
-    X_val_imp = X_val_df.fillna(
-        feature_medians
-    ).values
-
-    x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-
-    X_train_std = x_scaler.fit_transform(
-        X_train_imp
-    )
-
-    X_val_std = x_scaler.transform(
-        X_val_imp
-    )
-
-    y_train_std = y_scaler.fit_transform(
-        y_train.reshape(
-            -1,
-            1
-        )
-    ).ravel()
-
-    pls = NIPALSPLS1(
-        n_components=n_components
-    )
-
-    pls.fit(
-        X_train_std,
-        y_train_std
-    )
-
-    score_train = pls.predict(
-        X_train_std
-    )
-
-    score_val = pls.predict(
-        X_val_std
-    )
-
-    auc_train = roc_auc_score(
-        y_train,
-        score_train
-    )
-
-    auc_val = roc_auc_score(
-        y_val,
-        score_val
-    )
-
-    fpr, tpr, _ = roc_curve(
-        y_val,
-        score_val
-    )
-
-    return {
-        "model":
-            pls,
-        "feature_medians":
-            feature_medians,
-        "x_scaler":
-            x_scaler,
-        "y_scaler":
-            y_scaler,
-        "train_score":
-            score_train,
-        "val_score":
-            score_val,
-        "train_auc":
-            auc_train,
-        "val_auc":
-            auc_val,
-        "fpr":
-            fpr,
-        "tpr":
-            tpr,
-        "y_train":
-            y_train,
-        "y_val":
-            y_val,
-        "coef_std":
-            pls.B_.ravel(),
-        "n_train":
-            len(train),
-        "n_val":
-            len(val),
-        "n_pos_train":
-            n_pos_train,
-        "n_neg_train":
-            n_neg_train,
-        "n_pos_val":
-            n_pos_val,
-        "n_neg_val":
-            n_neg_val,
-        "train_index":
-            train.index,
-        "val_index":
-            val.index,
-    }
+def choose_body_size_covariate(df: pd.DataFrame):
+    if "bmi" in df.columns and df["bmi"].notna().mean() > 0.50:
+        return "bmi"
+    if "weight" in df.columns and df["weight"].notna().mean() > 0.50:
+        return "weight"
+    return None
 
 
-def score_all_with_candidate_model(
-    df_all,
-    features,
-    fitted_result
-):
-    """
-    Score an entire cohort with a frozen candidate model.
+def zscore(s):
+    s = pd.to_numeric(s, errors="coerce")
+    sd = s.std(ddof=0)
+    if pd.isna(sd) or sd == 0:
+        return pd.Series(np.nan, index=s.index)
+    return (s - s.mean()) / sd
 
-    Imputation medians and StandardScaler are discovery-fitted only.
-    """
-    X_all_df = df_all[
-        features
-    ].apply(
-        pd.to_numeric,
-        errors="coerce"
-    )
 
-    X_all_imp = X_all_df.fillna(
-        fitted_result[
-            "feature_medians"
+def find_first_existing_column(df: pd.DataFrame, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def p_to_text(p):
+    if pd.isna(p):
+        return "NA"
+    if p < 0.001:
+        return "<0.001"
+    return f"{p:.3f}"
+
+
+def p_to_star(p):
+    if pd.isna(p):
+        return ""
+    if p < 0.001:
+        return "***"
+    if p < 0.01:
+        return "**"
+    if p < 0.05:
+        return "*"
+    return "ns"
+
+
+def add_covariates(df: pd.DataFrame):
+    df = add_sex_male_if_needed(df)
+
+    covariates = []
+
+    if "age" in df.columns:
+        df["age_z"] = zscore(df["age"])
+        covariates.append("age_z")
+    else:
+        print("警告：缺少 age，调整模型不纳入年龄。")
+
+    if "sex_male" in df.columns:
+        covariates.append("sex_male")
+
+    body_col = choose_body_size_covariate(df)
+    if body_col is not None:
+        df[f"{body_col}_z"] = zscore(df[body_col])
+        covariates.append(f"{body_col}_z")
+        print(f"Body-size covariate: {body_col}")
+    else:
+        print("警告：缺少 BMI/weight，调整模型不纳入体型。")
+
+    return df, covariates
+
+
+# =========================================================
+# 4. 读取数据
+# =========================================================
+ensure_file_exists(FEATURE_FILE)
+ensure_file_exists(SCORE_FILE)
+
+feature_df = pd.read_csv(FEATURE_FILE, low_memory=False)
+score_df = pd.read_csv(SCORE_FILE, low_memory=False)
+
+if feature_df["stay_id"].duplicated().any():
+    raise ValueError("当前 feature matrix 中存在重复 stay_id。")
+if score_df["stay_id"].duplicated().any():
+    raise ValueError("当前 validation score 文件中存在重复 stay_id。")
+
+print(f"Current full cohort N: {len(feature_df):,}")
+print(f"Current scored validation N: {len(score_df):,}")
+
+feature_df = maybe_create_cld_flag(feature_df)
+
+flag_cols = list(CHRONIC_FLAGS.values())
+ensure_cols(feature_df, ["stay_id"] + flag_cols, "feature_matrix_full_0_6h.csv")
+ensure_cols(score_df, ["stay_id"], "fig5b_validation_candidate_scores.csv")
+
+for col in flag_cols:
+    feature_df[col] = prepare_binary_flag(feature_df[col])
+
+feature_df["chronic_count"] = feature_df[flag_cols].sum(axis=1).astype(int)
+feature_df["any_chronic_history"] = (feature_df["chronic_count"] > 0).astype(int)
+
+score_col = find_first_existing_column(score_df, SCORE_COL_CANDIDATES)
+
+if score_col is None:
+    print("当前 score 文件列名：")
+    print(score_df.columns.tolist())
+    raise ValueError("未找到 risk_score 列，请修改 SCORE_COL_CANDIDATES。")
+
+print(f"Risk score 使用列：{score_col}")
+
+score_df = score_df[["stay_id", score_col]].rename(columns={score_col: "risk_score"})
+
+df = feature_df.merge(
+    score_df,
+    on="stay_id",
+    how="inner",
+    validate="one_to_one"
+)
+print("Merged current validation shape:", df.shape)
+
+if len(df) != len(score_df):
+    print("WARNING: not every score-file stay_id matched the current feature matrix.")
+
+df["risk_score"] = pd.to_numeric(df["risk_score"], errors="coerce")
+
+if STANDARDIZE_SCORE:
+    df["plot_score"] = zscore(df["risk_score"])
+    y_label = "24–48 h organ-failure risk score, z-standardized"
+else:
+    df["plot_score"] = df["risk_score"]
+    y_label = "24–48 h organ-failure risk score"
+
+df, covariates = add_covariates(df)
+print("Covariates used in adjusted model:", covariates)
+
+# =========================================================
+# 5. 统计比较
+# =========================================================
+no_mask = df["chronic_count"] == 0
+no_scores = df.loc[no_mask, "plot_score"].dropna().values
+
+stats_rows = []
+
+for disease in DISEASE_ORDER:
+    col = CHRONIC_FLAGS[disease]
+
+    if DISEASE_GROUP_MODE == "single_only":
+        disease_mask = (df[col] == 1) & (df["chronic_count"] == 1)
+        group_label = f"{disease} only"
+    else:
+        disease_mask = df[col] == 1
+        group_label = f"{disease}"
+
+    disease_scores = df.loc[disease_mask, "plot_score"].dropna().values
+
+    n_no = len(no_scores)
+    n_dis = len(disease_scores)
+
+    if n_dis < 5 or n_no < 5:
+        mw_p = np.nan
+        t_p = np.nan
+    else:
+        mw_p = mannwhitneyu(
+            disease_scores,
+            no_scores,
+            alternative="two-sided"
+        ).pvalue
+
+        t_p = ttest_ind(
+            disease_scores,
+            no_scores,
+            equal_var=False,
+            nan_policy="omit"
+        ).pvalue
+
+    # adjusted linear model:
+    # plot_score ~ disease + age + sex + body size
+    temp = df.loc[no_mask | disease_mask, ["plot_score", col] + covariates].dropna().copy()
+    temp["disease_group"] = (temp[col] == 1).astype(int)
+
+    try:
+        y = temp["plot_score"].astype(float)
+        X = temp[["disease_group"] + covariates].astype(float)
+        X = sm.add_constant(X, has_constant="add")
+        model = sm.OLS(y, X).fit(cov_type="HC3")
+
+        beta = float(model.params["disease_group"])
+        ci_low, ci_high = model.conf_int().loc["disease_group"]
+        adj_p = float(model.pvalues["disease_group"])
+
+    except Exception as e:
+        beta = np.nan
+        ci_low = np.nan
+        ci_high = np.nan
+        adj_p = np.nan
+        print(f"{disease} adjusted model failed: {e}")
+
+    stats_rows.append({
+        "disease": disease,
+        "group_label": group_label,
+        "mode": DISEASE_GROUP_MODE,
+        "n_no_chronic": n_no,
+        "n_disease": n_dis,
+        "mean_no_chronic": float(np.nanmean(no_scores)) if n_no > 0 else np.nan,
+        "mean_disease": float(np.nanmean(disease_scores)) if n_dis > 0 else np.nan,
+        "median_no_chronic": float(np.nanmedian(no_scores)) if n_no > 0 else np.nan,
+        "median_disease": float(np.nanmedian(disease_scores)) if n_dis > 0 else np.nan,
+        "mean_difference": (
+            float(np.nanmean(disease_scores) - np.nanmean(no_scores))
+            if n_dis > 0 and n_no > 0 else np.nan
+        ),
+        "mannwhitney_p": mw_p,
+        "ttest_p": t_p,
+        "adjusted_beta": beta,
+        "adjusted_ci_low": float(ci_low) if pd.notna(ci_low) else np.nan,
+        "adjusted_ci_high": float(ci_high) if pd.notna(ci_high) else np.nan,
+        "adjusted_p": adj_p,
+    })
+
+stats_df = pd.DataFrame(stats_rows)
+
+# FDR
+for p_col in ["mannwhitney_p", "ttest_p", "adjusted_p"]:
+    valid = stats_df[p_col].notna()
+    q_col = p_col.replace("_p", "_q")
+    stats_df[q_col] = np.nan
+
+    if valid.sum() > 0:
+        _, q, _, _ = multipletests(stats_df.loc[valid, p_col], method="fdr_bh")
+        stats_df.loc[valid, q_col] = q
+
+stats_df["mannwhitney_q_text"] = stats_df["mannwhitney_q"].apply(p_to_text)
+stats_df["mannwhitney_star"] = stats_df["mannwhitney_q"].apply(p_to_star)
+stats_df["adjusted_q_text"] = stats_df["adjusted_q"].apply(p_to_text)
+stats_df["adjusted_star"] = stats_df["adjusted_q"].apply(p_to_star)
+
+stats_path = OUTDIR / "fig6d1_current_chronic_vs_nochronic_risk_score_stats.csv"
+stats_df.to_csv(stats_path, index=False, encoding="utf-8-sig")
+
+print("\nStatistics:")
+print(
+    stats_df[
+        [
+            "disease",
+            "n_no_chronic",
+            "n_disease",
+            "mean_difference",
+            "mannwhitney_p",
+            "mannwhitney_q",
+            "adjusted_beta",
+            "adjusted_p",
+            "adjusted_q",
         ]
-    ).values
+    ].round(4)
+)
 
-    X_all_std = fitted_result[
-        "x_scaler"
-    ].transform(
-        X_all_imp
+# =========================================================
+# 6. 绘图
+# =========================================================
+fig, ax = plt.subplots(figsize=(9, 4.6))
+
+positions_no = []
+positions_dis = []
+box_data = []
+box_colors = []
+
+for i, disease in enumerate(DISEASE_ORDER):
+    col = CHRONIC_FLAGS[disease]
+
+    if DISEASE_GROUP_MODE == "single_only":
+        disease_mask = (df[col] == 1) & (df["chronic_count"] == 1)
+    else:
+        disease_mask = df[col] == 1
+
+    no_vals = df.loc[no_mask, "plot_score"].dropna().values
+    dis_vals = df.loc[disease_mask, "plot_score"].dropna().values
+
+    pos_no = i - 0.18
+    pos_dis = i + 0.18
+
+    positions_no.append(pos_no)
+    positions_dis.append(pos_dis)
+
+    box_data.extend([no_vals, dis_vals])
+    box_colors.extend([NO_CHRONIC_COLOR, DISEASE_COLORS[disease]])
+
+positions = []
+for p1, p2 in zip(positions_no, positions_dis):
+    positions.extend([p1, p2])
+
+bp = ax.boxplot(
+    box_data,
+    positions=positions,
+    widths=0.28,
+    patch_artist=True,
+    showfliers=False,
+    medianprops=dict(color="black", linewidth=1.2),
+    whiskerprops=dict(color="black", linewidth=0.8),
+    capprops=dict(color="black", linewidth=0.8),
+)
+
+for patch, color in zip(bp["boxes"], box_colors):
+    patch.set_facecolor(color)
+    patch.set_edgecolor("black")
+    patch.set_alpha(0.80)
+    patch.set_linewidth(0.8)
+
+# 添加显著性标记：默认用 Mann-Whitney FDR q
+y_min, y_max = ax.get_ylim()
+data_y_max = np.nanmax(df["plot_score"].values)
+data_y_min = np.nanmin(df["plot_score"].values)
+y_range = data_y_max - data_y_min
+
+for i, disease in enumerate(DISEASE_ORDER):
+    row = stats_df[stats_df["disease"] == disease].iloc[0]
+
+    star = row["mannwhitney_star"]
+
+    if star == "ns":
+        star_show = "ns"
+    else:
+        star_show = star
+
+    x1 = i - 0.18
+    x2 = i + 0.18
+
+    y = 3.2 + 0.18 * (i % 2)
+    h = 0.08
+
+    ax.plot(
+        [x1, x1, x2, x2],
+        [y, y + h, y + h, y],
+        color="black",
+        linewidth=0.8
     )
 
-    return fitted_result[
-        "model"
-    ].predict(
-        X_all_std
-    )
-
-
-def draw_candidate_model_figure(auc_table, roc_dict):
-    fig = plt.figure(figsize=(3.2, 2.2))
-    gs = fig.add_gridspec(1, 2, width_ratios=[3.4, 1.2], wspace=0.05)
-
-    ax_roc = fig.add_subplot(gs[0, 0])
-    ax_hm = fig.add_subplot(gs[0, 1])
-
-    for group_name in ["No chronic history", "Any chronic history"]:
-        for organ_name in ORGAN_ORDER[::-1]:
-            rec = roc_dict[(group_name, organ_name)]
-            ax_roc.plot(
-                rec["fpr"],
-                rec["tpr"],
-                linestyle=LINESTYLES[group_name],
-                linewidth=2.0,
-                color=ORGAN_COLORS[organ_name],
-                alpha=0.95,
-            )
-
-    ax_roc.plot([0, 1], [0, 1], color="gray", lw=1.0, ls=":")
-    ax_roc.set_xlim(0, 1)
-    ax_roc.set_ylim(0, 1)
-    ax_roc.set_xlabel("False-positive rate")
-    ax_roc.set_ylabel("True-positive rate")
-    ax_roc.set_aspect("equal", adjustable="box")
-    ax_roc.spines["top"].set_visible(False)
-    ax_roc.spines["right"].set_visible(False)
-    ax_roc.spines["left"].set_linewidth(1.0)
-    ax_roc.spines["bottom"].set_linewidth(1.0)
-    ax_roc.tick_params(axis="both", length=5)
-
-    ax_roc.plot([], [], "--", color="black", lw=2, label="No chronic history")
-    ax_roc.plot([], [], "-", color="black", lw=2, label="Any chronic history")
-    ax_roc.legend(
-        frameon=False,
-        loc="lower right",
+    ax.text(
+        (x1 + x2) / 2,
+        y + h,
+        star_show,
+        ha="center",
+        va="bottom",
         fontsize=6,
-        handlelength=1.6,
-        borderpad=0.2,
-        labelspacing=0.3,
+        color="black"
     )
 
-    heat_df = auc_table.loc[
-        ["Respiratory", "Cardiovascular", "Renal", "Liver", "Coagulation"],
-        ["No chronic history", "Any chronic history"],
-    ].loc[ORGAN_ORDER]
+ax.set_xticks(range(len(DISEASE_ORDER)))
+ax.set_xticklabels(
+    DISEASE_ORDER,
+    rotation=0
+)
+# 横坐标轴两端加短刻度线
+ax.spines["bottom"].set_bounds(-0.5, len(DISEASE_ORDER) - 0.5)
 
-    vmin = 0.75
-    vmax = 0.93
-    im = ax_hm.imshow(heat_df.values, aspect="equal", cmap="magma_r", vmin=vmin, vmax=vmax)
+ax.set_xticks(
+    [-0.5, len(DISEASE_ORDER) - 0.5],
+    minor=True
+)
 
-    threshold = (vmin + vmax) / 2
-    for i in range(heat_df.shape[0]):
-        for j in range(heat_df.shape[1]):
-            val = heat_df.iloc[i, j]
-            if pd.notna(val):
-                text_color = "white" if val > threshold else "black"
-                ax_hm.text(
-                    j,
-                    i,
-                    f"{val:.2f}",
-                    ha="center",
-                    va="center",
-                    color=text_color,
-                    fontsize=6,
-                )
+ax.tick_params(
+    axis="x",
+    which="minor",
+    bottom=True,
+    top=False,
+    length=5,
+    width=1.0,
+    direction="out"
+)
 
-    ax_hm.set_xticks([0, 1])
-    xtick_labels = ax_hm.set_xticklabels(
-        ["No chronic\nhistory", "Any chronic\nhistory"],
-        rotation=90,
-    )
-    xtick_labels[0].set_color("#f39c12")
-    xtick_labels[1].set_color("#e41a1c")
-    ax_hm.set_yticks(np.arange(len(ORGAN_ORDER)))
-    ax_hm.set_yticklabels([""] * len(ORGAN_ORDER))
-    ax_hm.set_ylabel("AUC-ROC (failure vs five-organ failure-free)", fontsize=6)
-    ax_hm.yaxis.set_label_coords(-0.1, 0.5)
+ax.set_ylabel(y_label)
+ax.set_yticks([-2, 0, 2, 4])
+ax.set_ylim(-2.5, 4.5)
+ax.spines["left"].set_bounds(-2, 4)
 
-    for i, organ in enumerate(ORGAN_ORDER):
-        ax_hm.add_patch(
-            plt.Rectangle(
-                (-0.55, i - 0.5),
-                0.15,
-                1.0,
-                color=ORGAN_COLORS[organ],
-                transform=ax_hm.transData,
-                clip_on=False,
-            )
-        )
+# 将 x 坐标轴移动到 y = -2 的位置
+ax.spines["bottom"].set_position(("data", -2))
+ax.spines["bottom"].set_bounds(-0.5, len(DISEASE_ORDER) - 0.5)
 
-    cax = inset_axes(
-        ax_hm,
-        width="55%",
-        height="5%",
-        loc="upper center",
-        bbox_to_anchor=(0, 0.1, 1, 1),
-        bbox_transform=ax_hm.transAxes,
-    )
-    cb = fig.colorbar(im, cax=cax, orientation="horizontal")
-    cb.outline.set_visible(False)
-    cb.ax.tick_params(length=0, pad=1)
-    cb.set_label("")
-    cb.set_ticks([])
-    cax.text(-0.08, 0.5, f"{vmin:.1f}", transform=cax.transAxes, va="center", ha="right", fontsize=6)
-    cax.text(1.08, 0.5, f"{vmax:.1f}", transform=cax.transAxes, va="center", ha="left", fontsize=6)
+if DISEASE_GROUP_MODE == "single_only":
+    title_suffix = "single-disease patients vs no chronic history"
+else:
+    title_suffix = "patients with each chronic disease vs no chronic history"
 
-    for spine in ax_hm.spines.values():
-        spine.set_visible(False)
-    ax_hm.tick_params(length=0)
+ax.set_title(
+    f"Early risk-score distribution: {title_suffix}",
+    pad=14,
+    fontweight="bold"
+)
 
-    fig.text(0.01, 0.98, "b", fontsize=6, fontweight="bold", va="top")
-    plt.tight_layout()
-    return fig
+ax.grid(axis="y", color="#d9d9d9", linestyle="--", linewidth=0.7, alpha=0.8)
+ax.set_axisbelow(True)
+
+for spine in ["top", "right"]:
+    ax.spines[spine].set_visible(False)
+# 让横纵坐标轴稍微分开
+ax.spines["left"].set_position(("outward", 6))
+# ax.spines["bottom"].set_position(("outward", 6))
+
+legend_handles = [
+    Patch(facecolor=NO_CHRONIC_COLOR, edgecolor="black", label="No chronic history"),
+]
+
+ax.legend(
+    handles=legend_handles,
+    frameon=False,
+    loc="upper left",
+    fontsize=6
+)
 
 
-def main():
-    if not FULL_MATRIX.exists():
-        raise FileNotFoundError(f"找不到当前 feature matrix: {FULL_MATRIX}")
 
-    if not DISCOVERY_SCORE_FILE.exists():
-        raise FileNotFoundError(
-            f"找不到当前 Discovery 评分文件: {DISCOVERY_SCORE_FILE}"
-        )
+plt.tight_layout(rect=[0.01, 0.01, 0.99, 0.99])
 
-    full = pd.read_csv(
-        FULL_MATRIX,
-        low_memory=False
-    )
-
-    risk_df = pd.read_csv(
-        VALIDATION_SCORE_FILE,
-        usecols=["stay_id", "risk_score"],
-        low_memory=False
-    ).drop_duplicates("stay_id")
-
-    discovery_risk_df = pd.read_csv(
-        DISCOVERY_SCORE_FILE,
-        usecols=["stay_id", "risk_score"],
-        low_memory=False
-    ).drop_duplicates("stay_id")
-
-    if full["stay_id"].duplicated().any():
-        raise ValueError("Current feature matrix contains duplicated stay_id.")
-
-    full = prepare_data(full)
-
-    required_cols = list(
-        set(
-            FEATURES
-            + CHRONIC_FLAG_COLS
-            + list(ORGAN_TARGETS.values())
-            + [
-                "stay_id",
-                "burden5_official_24_48",
-                "burden5_official_48_72",
-            ]
-        )
-    )
-
-    ensure_required_cols(
-        full,
-        required_cols,
-        "feature_matrix_full_0_6h.csv"
-    )
-
-    validation_ids = set(
-        risk_df["stay_id"].tolist()
-    )
-
-    df_validation = full[
-        full["stay_id"].isin(validation_ids)
-    ].copy()
-
-    df_discovery = full[
-        ~full["stay_id"].isin(validation_ids)
-    ].copy()
-
-    print(
-        f"Full cohort N={len(full):,}; "
-        f"Discovery IDs={len(df_discovery):,}; "
-        f"Validation IDs={len(df_validation):,}"
-    )
-
-    # Primary candidate-model training population: discovery patients with
-    # an available 24–48 h five-organ burden.
-    df_discovery = df_discovery[
-        pd.to_numeric(
-            df_discovery["burden5_official_24_48"],
-            errors="coerce"
-        ).notna()
-    ].copy()
-
-    df_discovery = df_discovery.merge(
-        discovery_risk_df,
-        on="stay_id",
-        how="inner",
-        validate="one_to_one"
-    )
-
-    # Lock validation to the same common n=6,246 used in current Fig.3.
-    df_validation = df_validation[
-        pd.to_numeric(
-            df_validation["burden5_official_24_48"],
-            errors="coerce"
-        ).notna()
-        &
-        pd.to_numeric(
-            df_validation["burden5_official_48_72"],
-            errors="coerce"
-        ).notna()
-    ].copy()
-
-    df_validation = df_validation.merge(
-        risk_df,
-        on="stay_id",
-        how="left",
-        validate="one_to_one"
-    )
-
-    print(f"Discovery 24–48 h available N={len(df_discovery):,}")
-    print(f"Common validation N={len(df_validation):,}")
-
-    if len(df_discovery) != 25030:
-        print(
-            f"WARNING: expected Discovery N=25,030, "
-            f"but current N={len(df_discovery):,}."
-        )
-
-    if len(df_validation) != 6246:
-        print(
-            f"WARNING: expected common validation N=6,246, "
-            f"but current N={len(df_validation):,}."
-        )
-
-    auc_records = []
-    summary_records = []
-    weight_dict = {}
-    roc_dict = {}
-
-    val_scores_out = df_validation[
-        [
-            "stay_id",
-            "any_chronic_history",
-            "risk_score",
-            "burden5_official_24_48",
-            "burden5_official_48_72",
-        ]
-        + list(ORGAN_TARGETS.values())
-    ].copy()
-
-    discovery_scores_out = df_discovery[
-        [
-            "stay_id",
-            "any_chronic_history",
-            "risk_score",
-            "burden5_official_24_48",
-            "burden5_official_48_72",
-        ]
-        + list(ORGAN_TARGETS.values())
-    ].copy()
-
-    # 与原fig2f一致：验证集中burden=0的全部患者为共同对照，
-    # 不按慢病史分组。训练仍为各慢病组内目标器官衰竭 vs 未衰竭。
-    # 完全沿用原fig2f的参考组规则，仅以五器官总负担为0判定。
-    # 不额外检查单器官标签，也不排除单器官标签缺失的参考组记录。
-    reference_validation = df_validation[
-        pd.to_numeric(
-            df_validation["burden5_official_24_48"], errors="coerce"
-        ).eq(0)
-    ].copy()
-    print(f"Shared burden=0 validation controls N={len(reference_validation):,}")
-
-    for group_name, group_value in GROUPS.items():
-        print("\n" + "=" * 70)
-        print(f"Training subgroup: {group_name}")
-        print("=" * 70)
-
-        df_train_g = df_discovery[
-            df_discovery["any_chronic_history"] == group_value
-        ].copy()
-
-        df_val_g = df_validation[
-            df_validation["any_chronic_history"] == group_value
-        ].copy()
-
-        print(f"Discovery n = {len(df_train_g):,}")
-        print(f"Validation n = {len(df_val_g):,}")
-
-        for organ_name, target_col in ORGAN_TARGETS.items():
-            model_name = f"{GROUP_SHORT[group_name]} {organ_name}"
-            print(f"\n[{model_name}] target = {target_col}")
-
-            # 阳性：本慢病组内目标器官衰竭；阴性：共同五器官未衰竭对照。
-            cases_validation = df_val_g[df_val_g[target_col] == 1].copy()
-            controls_validation = reference_validation.copy()
-            # 原fig2f使用ref.assign(label=0)给参考组指定评价标签。
-            # 此处仅修改评价副本，不改动原数据或训练标签。
-            controls_validation[target_col] = 0
-            evaluation_validation = pd.concat(
-                [controls_validation, cases_validation], ignore_index=True
-            )
-            print(
-                f"Evaluation pos={len(cases_validation):,}, "
-                f"shared neg={len(controls_validation):,}"
-            )
-            res = fit_one_candidate_model(
-                df_train=df_train_g,
-                df_val=evaluation_validation,
-                features=FEATURES,
-                target=target_col,
-                n_components=N_COMPONENTS,
-            )
-
-            auc_records.append({
-                "organ": organ_name,
-                "group": group_name,
-                "model_name": model_name,
-                "target": target_col,
-                "auc_train": res["train_auc"],
-                "auc_val": res["val_auc"],
-                "validation_control_definition": "burden5_official_24_48 == 0; evaluation label=0; shared across chronic groups",
-                "training_control_definition": "target == 0; within chronic group",
-            })
-
-            summary_records.append({
-                "organ": organ_name,
-                "group": group_name,
-                "model_name": model_name,
-                "target": target_col,
-                "n_components": N_COMPONENTS,
-                "n_train": res["n_train"],
-                "n_val": res["n_val"],
-                "n_pos_train": res["n_pos_train"],
-                "n_neg_train": res["n_neg_train"],
-                "n_pos_val": res["n_pos_val"],
-                "n_neg_val": res["n_neg_val"],
-                "auc_train": res["train_auc"],
-                "auc_val": res["val_auc"],
-                "validation_control_definition": "burden5_official_24_48 == 0; evaluation label=0; shared across chronic groups",
-                "training_control_definition": "target == 0; within chronic group",
-            })
-
-            weight_dict[model_name] = res["coef_std"]
-
-            roc_dict[(group_name, organ_name)] = {
-                "fpr": res["fpr"],
-                "tpr": res["tpr"],
-                "auc": res["val_auc"],
-            }
-
-            score_col = (
-                f"score_"
-                f"{GROUP_SHORT[group_name].lower().replace('-', '_')}_"
-                f"{organ_name.lower()}"
-            )
-
-            val_scores_out[score_col] = (
-                score_all_with_candidate_model(
-                    df_all=df_validation,
-                    features=FEATURES,
-                    fitted_result=res
-                )
-            )
-
-            discovery_scores_out[score_col] = (
-                score_all_with_candidate_model(
-                    df_all=df_discovery,
-                    features=FEATURES,
-                    fitted_result=res
-                )
-            )
-
-    auc_df_long = pd.DataFrame(auc_records)
-    summary_df = pd.DataFrame(summary_records)
-
-    auc_table = auc_df_long.pivot(
-        index="organ",
-        columns="group",
-        values="auc_val"
-    )[
-        ["No chronic history", "Any chronic history"]
-    ]
-
-    train_auc_table = auc_df_long.pivot(
-        index="organ",
-        columns="group",
-        values="auc_train"
-    )[
-        ["No chronic history", "Any chronic history"]
-    ]
-
-    weight_df = pd.DataFrame(
-        weight_dict,
-        index=FEATURES
-    )
-    weight_df.index.name = "feature"
-
-    weight_df_long = (
-        weight_df.reset_index()
-        .melt(
-            id_vars="feature",
-            var_name="model_name",
-            value_name="coef_std"
-        )
-    )
-
-    auc_df_long.to_csv(
-        OUTDIR / "fig5b_candidate_models_auc_long.csv",
-        index=False,
-        encoding="utf-8-sig"
-    )
-    auc_table.to_csv(
-        OUTDIR / "fig5b_candidate_models_auc_table.csv",
-        encoding="utf-8-sig"
-    )
-    train_auc_table.to_csv(
-        OUTDIR / "fig5b_candidate_models_train_auc_table.csv",
-        encoding="utf-8-sig"
-    )
-    summary_df.to_csv(
-        OUTDIR / "fig5b_candidate_models_summary.csv",
-        index=False,
-        encoding="utf-8-sig"
-    )
-    weight_df.to_csv(
-        OUTDIR / "fig5b_candidate_models_weights_wide.csv",
-        encoding="utf-8-sig"
-    )
-    weight_df_long.to_csv(
-        OUTDIR / "fig5b_candidate_models_weights_long.csv",
-        index=False,
-        encoding="utf-8-sig"
-    )
-    val_scores_out.to_csv(
-        OUTDIR / "fig5b_validation_candidate_scores.csv",
-        index=False,
-        encoding="utf-8-sig"
-    )
-    discovery_scores_out.to_csv(
-        OUTDIR / "fig5b_discovery_candidate_scores.csv",
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    print(
-        "\nSaved Discovery candidate scores: "
-        f"{OUTDIR / 'fig5b_discovery_candidate_scores.csv'} "
-        f"(N={len(discovery_scores_out):,})"
-    )
-
-    print(
-        "\nValidation AUC table "
-        "(0–6 h predictors -> 24–48 h organ failure):"
-    )
-    print(auc_table.round(3))
-
-    fig = draw_candidate_model_figure(
-        auc_table,
-        roc_dict
-    )
-
-    png_path = OUTDIR / "fig5b_candidate_models_0_6_to_24_48.png"
-    pdf_path = OUTDIR / "fig5b_candidate_models_0_6_to_24_48.pdf"
-    svg_path = OUTDIR / "fig5b_candidate_models_0_6_to_24_48.svg"
-
-    fig.savefig(
-        png_path,
-        dpi=300,
-        bbox_inches="tight"
-    )
-    fig.savefig(
-        pdf_path,
-        dpi=300,
-        bbox_inches="tight"
-    )
-    fig.savefig(
-        svg_path,
-        bbox_inches="tight"
-    )
-    plt.close(fig)
-
-    print(f"\nSaved: {png_path}")
-    print(f"Saved: {pdf_path}")
+png_path = OUTDIR / "fig6d1_current_chronic_vs_nochronic_risk_score_boxplot.png"
+pdf_path = OUTDIR / "fig6d1_current_chronic_vs_nochronic_risk_score_boxplot.pdf"
+svg_path = OUTDIR / "fig6d1_current_chronic_vs_nochronic_risk_score_boxplot.svg"
 
 
-if __name__ == "__main__":
-    main()
+plt.savefig(png_path, dpi=300, bbox_inches="tight")
+plt.savefig(pdf_path, bbox_inches="tight")
+plt.savefig(svg_path, bbox_inches="tight")
+
+plt.show()
+plt.close(fig)
+
+print("\nSaved:")
+print(stats_path.resolve())
+print(png_path.resolve())
+print(pdf_path.resolve())
